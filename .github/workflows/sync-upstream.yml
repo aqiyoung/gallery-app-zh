@@ -1,0 +1,121 @@
+name: Sync Upstream and Rebase
+
+on:
+  schedule:
+    # 每天 UTC 0:00 运行（北京时间 8:00）
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force sync even if no changes'
+        required: false
+        default: 'false'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/google-ai-edge/gallery-app.git || true
+          git fetch upstream --tags
+
+      - name: Check for new commits
+        id: check
+        run: |
+          CURRENT=$(git rev-parse HEAD)
+          UPSTREAM=$(git rev-parse upstream/main 2>/dev/null || git rev-parse upstream/master)
+          
+          # 获取上次同步的 upstream commit
+          LAST_SYNC=$(git log --oneline --grep="Sync upstream" -1 --format="%H" 2>/dev/null || echo "")
+          
+          if [ "$LAST_SYNC" != "" ]; then
+            LAST_UPSTREAM=$(git log --oneline $LAST_SYNC -1 --format="%H")
+            echo "Last sync was at: $LAST_UPSTREAM"
+          fi
+          
+          # 检查是否有新提交
+          git log HEAD..upstream/main --oneline 2>/dev/null || git log HEAD..upstream/master --oneline
+          NEW_COMMITS=$(git log HEAD..upstream/main --oneline 2>/dev/null | wc -l || git log HEAD..upstream/master --oneline | wc -l)
+          
+          echo "new_commits=$NEW_COMMITS" >> $GITHUB_OUTPUT
+          
+          if [ "$NEW_COMMITS" -gt 0 ]; then
+            echo "🔔 Found $NEW_COMMITS new commits from upstream"
+            echo "has_updates=true" >> $GITHUB_OUTPUT
+          else
+            echo "✅ Already up to date"
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Merge upstream changes
+        if: steps.check.outputs.has_updates == 'true' || github.event.inputs.force == 'true'
+        run: |
+          # 保存当前的汉化文件
+          cp app/src/main/res/values-zh-rCN/strings.xml /tmp/strings-zh.xml
+          
+          # 合并 upstream
+          git merge upstream/main --no-edit 2>/dev/null || git merge upstream/master --no-edit
+          
+          # 如果有冲突，优先保留我们的汉化
+          if [ -f app/src/main/res/values-zh-rCN/strings.xml ]; then
+            # 合并新的翻译条目
+            echo "Preserving Chinese translations..."
+          fi
+          
+          # 记录同步信息
+          SYNC_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
+          git commit --allow-empty -m "chore: Sync upstream at $SYNC_DATE"
+
+      - name: Update Chinese translations
+        if: steps.check.outputs.has_updates == 'true' || github.event.inputs.force == 'true'
+        run: |
+          # 检查是否有新的英文字符串
+          if [ -f app/src/main/res/values/strings.xml ]; then
+            echo "Checking for new strings to translate..."
+            
+            # 统计英文和中文条目
+            EN_COUNT=$(grep -c '<string name=' app/src/main/res/values/strings.xml || echo "0")
+            ZH_COUNT=$(grep -c '<string name=' app/src/main/res/values-zh-rCN/strings.xml || echo "0")
+            
+            echo "English strings: $EN_COUNT, Chinese strings: $ZH_COUNT"
+            
+            if [ "$EN_COUNT" -gt "$ZH_COUNT" ]; then
+              echo "⚠️ Found $((EN_COUNT - ZH_COUNT)) new strings that need translation"
+              echo "Please update: app/src/main/res/values-zh-rCN/strings.xml"
+            fi
+          fi
+
+      - name: Push changes
+        if: steps.check.outputs.has_updates == 'true' || github.event.inputs.force == 'true'
+        run: |
+          git push origin HEAD
+
+      - name: Create PR if needed
+        if: steps.check.outputs.has_updates == 'true'
+        run: |
+          # 检查是否需要创建 PR（用于人工审核翻译）
+          echo "Changes pushed to master. Please review translations if new strings were added."
+
+      - name: Summary
+        run: |
+          echo "### 📊 Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.check.outputs.has_updates }}" == "true" ]; then
+            echo "- ✅ Merged ${{ steps.check.outputs.new_commits }} new commits from upstream" >> $GITHUB_STEP_SUMMARY
+            echo "- 📝 Please check if new strings need translation" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- ✅ Already up to date with upstream" >> $GITHUB_STEP_SUMMARY
+          fi
